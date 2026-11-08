@@ -1624,7 +1624,7 @@ static void DrawPpuFrameWithPerf(void) {
    * wrong before dumping anything. */
   {
     static const char *dir, *log_path;
-    static long from = -1, to = -1;
+    static long from = -1, to = -1, every = 1;
     static unsigned presents;
     static FILE *csv;
     if (from == -1) {
@@ -1636,6 +1636,11 @@ static void DrawPpuFrameWithPerf(void) {
       from = v ? strtol(v, NULL, 0) : 0;
       v = HostGetenv("SCREENSHOT_TO");
       to = v ? strtol(v, NULL, 0) : LONG_MAX;
+      /* SCREENSHOT_EVERY=<n>: dump only every n-th present in the range,
+       * so a long play-through can be scanned without 170 KB per frame. */
+      v = HostGetenv("SCREENSHOT_EVERY");
+      every = v ? strtol(v, NULL, 0) : 1;
+      if (every < 1) every = 1;
     }
     if ((dir || log_path) && (long)g_present_frame >= from &&
         (long)g_present_frame <= to) {
@@ -1665,7 +1670,7 @@ static void DrawPpuFrameWithPerf(void) {
                 g_present_alpha, crc, sum / (3.0 * w * h));
         fflush(csv);
       }
-      if (dir) {
+      if (dir && (((long)g_present_frame - from) % every) == 0) {
         snprintf(path, sizeof(path), "%s/present_%06u.ppm", dir, presents);
         WritePpm(path, pixel_buffer, pitch, w, h, g_present_frame, false);
       }
