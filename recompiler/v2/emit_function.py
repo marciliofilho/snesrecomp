@@ -1727,7 +1727,31 @@ def emit_function(rom: bytes, bank: int, start: int,
                                     _is_invalid_lorom_call_target,
                                     get_name_for_pc,
                                     has_exact_variant)
-                                if (_is_invalid_lorom_call_target(target_pc24)
+                                tgt_bank_byte = (target_pc24 >> 16) & 0xFF
+                                if tgt_bank_byte in (0x7E, 0x7F):
+                                    # Cross-bank JML into WRAM ($7E/$7F) is
+                                    # real code: many games copy a dispatcher
+                                    # or hot routine into work RAM at boot
+                                    # and JML to it. It is not a ROM code
+                                    # address, so no AOT function can be
+                                    # synthesized for it; set PB (JML changes
+                                    # the program bank) and tail-dispatch
+                                    # through the authoritative LLE tier,
+                                    # which fetches the live WRAM bytes.
+                                    # Treating this as an invalid LoROM target
+                                    # used to emit a no-op return and deadlock
+                                    # the SA-1 mailbox handshake in Kirby DL3
+                                    # ($00:A951 JML $7E0220).
+                                    lines.append(
+                                        f"cpu->PB = 0x{tgt_bank_byte:02X}; "
+                                        f"/* JML into WRAM */"
+                                    )
+                                    lines.append(_lle_tail_stmt(
+                                        target_pc24, insn.addr,
+                                        f"/* cross-bank JML into WRAM "
+                                        f"${target_pc24:06X} -> authoritative "
+                                        f"LLE */"))
+                                elif (_is_invalid_lorom_call_target(target_pc24)
                                         and get_name_for_pc(target_pc24)
                                         is None):
                                     # Cross-bank JML to a non-code address
