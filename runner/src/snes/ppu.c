@@ -3367,11 +3367,13 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * field that had just ended, at lines it had already drawn.
  *
  * Every display register is journaled: $2100-$2133 except the data ports and
- * their address registers (VRAM $2115-$2119, CGRAM $2121/$2122, OAMDATA
- * $2104), which are uploads rather than per-line display state, plus HDMAEN
- * ($420C), which is handed back to the host because HDMA lives in the DMA
- * unit. The set used to be the five registers one title's handlers wrote;
- * the next title wrote a sixth and drew black.
+ * their address registers (VRAM $2115-$2119, OAMDATA $2104), which are uploads
+ * rather than per-line display state, plus HDMAEN ($420C), which is handed back
+ * to the host because HDMA lives in the DMA unit. CGRAM ($2121/$2122) is NOT in
+ * that exclusion: a title may swap a palette mid-field, so it is per-line
+ * display state too and its table is carried in the field baseline. The set
+ * used to be the five registers one title's handlers wrote; the next title
+ * wrote a sixth and drew black.
  *
  * Writes the render walk makes itself (its HDMA, and this replay) are not
  * journaled: they are the field being reconstructed, not new history. HDMA
@@ -3394,7 +3396,9 @@ void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook) {
   s_vram_write_log_hook = hook;
 }
 
-#define PPU_RASTER_MAX 4096
+/* Room for a field's display-register writes plus a full 256-colour CGRAM
+ * upload (~512 $2122 bytes) and a mid-frame palette patch. */
+#define PPU_RASTER_MAX 8192
 /* key: beam position within the field, monotonic from its start at V=225
  * (0) through vblank (36 = V=261) and the visible lines (37 = V=0 ...). */
 typedef struct { uint16_t key; uint16_t reg; uint8_t val; } PpuRasterEntry;
@@ -3402,6 +3406,13 @@ typedef struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
   uint8_t scrollPrev, scrollPrev2, m7prev;
   uint8_t hdmaen;
+  /* CGRAM lives outside the register block but it is per-line display state:
+   * a title that swaps a palette mid-frame (Kirby's Dream Land 3 patches it at
+   * V=168 and rewrites the whole table at V=232) draws with the copy on the
+   * beam, so the field carries its own table plus the two-byte latch that
+   * pairs $2122 writes. */
+  uint16_t cgram[0x100];
+  uint8_t cgramPointer, cgramSecondWrite, cgramBuffer;
   int count;
   uint32_t dropped;
   PpuRasterEntry e[PPU_RASTER_MAX];
@@ -3418,6 +3429,13 @@ static int s_raster_hdmaen_pending;
 static struct {
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
 } s_raster_port;
+/* CGRAM and its port latch as the guest left them when the render began, so
+ * ppu_rasterRenderEnd can hand the guest back exactly the table it wrote rather
+ * than the table the reconstructed field drew with. */
+static struct {
+  uint16_t cgram[0x100];
+  uint8_t pointer, secondWrite, buffer;
+} s_raster_cgram_live;
 
 /* Only the machine's PPU journals: the debug server and a few tools run
  * ppu_write on scratch copies. */
@@ -3438,7 +3456,6 @@ static int raster_reg_journaled(uint16_t reg) {
     case 0x2104:                                       /* OAMDATA */
     case 0x2115: case 0x2116: case 0x2117:             /* VRAM port */
     case 0x2118: case 0x2119:
-    case 0x2121: case 0x2122:                          /* CGRAM port */
       return 0;
     default:
       return 1;
@@ -3451,6 +3468,10 @@ static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
   f->scrollPrev2 = ppu->scrollPrev2;
   f->m7prev = ppu->m7prev;
   f->hdmaen = g_snesrecomp_last_hdmaen;
+  memcpy(f->cgram, ppu->cgram, sizeof(f->cgram));
+  f->cgramPointer = ppu->cgramPointer;
+  f->cgramSecondWrite = ppu->cgramSecondWrite;
+  f->cgramBuffer = ppu->cgramBuffer;
   f->count = 0;
   f->dropped = 0;
 }
@@ -3527,10 +3548,18 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_port.oamInHigh = ppu->oamInHigh;
   s_raster_port.oamSecondWrite = ppu->oamSecondWrite;
   s_raster_port.oamBuffer = ppu->oamBuffer;
+  memcpy(s_raster_cgram_live.cgram, ppu->cgram, sizeof(ppu->cgram));
+  s_raster_cgram_live.pointer = ppu->cgramPointer;
+  s_raster_cgram_live.secondWrite = ppu->cgramSecondWrite;
+  s_raster_cgram_live.buffer = ppu->cgramBuffer;
   memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
   ppu->scrollPrev = f->scrollPrev;
   ppu->scrollPrev2 = f->scrollPrev2;
   ppu->m7prev = f->m7prev;
+  memcpy(ppu->cgram, f->cgram, sizeof(ppu->cgram));
+  ppu->cgramPointer = f->cgramPointer;
+  ppu->cgramSecondWrite = f->cgramSecondWrite;
+  ppu->cgramBuffer = f->cgramBuffer;
   s_raster_render = f;
   s_raster_next = 0;
   s_raster_hdmaen_pending = 0;
@@ -3590,6 +3619,14 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   ppu->oamInHigh = s_raster_port.oamInHigh;
   ppu->oamSecondWrite = s_raster_port.oamSecondWrite;
   ppu->oamBuffer = s_raster_port.oamBuffer;
+  /* The register replay above restored the field's CGRAM writes as part of
+   * the journal. The guest's own table is the live one saved at render begin;
+   * put it back so the frame that drew with the reconstructed palette does not
+   * leave that palette in the machine's CGRAM. */
+  memcpy(ppu->cgram, s_raster_cgram_live.cgram, sizeof(ppu->cgram));
+  ppu->cgramPointer = s_raster_cgram_live.pointer;
+  ppu->cgramSecondWrite = s_raster_cgram_live.secondWrite;
+  ppu->cgramBuffer = s_raster_cgram_live.buffer;
 }
 
 /* Snapshot of the journal as the renderer will consume it, for the debug
