@@ -1026,10 +1026,24 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
                     (unsigned long long)s_lle_master_deadline);
         }
     }
-    const int reached =
+    const int in_aot_run =
         cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
-        s_lle_master_deadline != 0 &&
-        cpu->master_cycles >= s_lle_master_deadline;
+        s_lle_master_deadline != 0;
+    int reached = in_aot_run && cpu->master_cycles >= s_lle_master_deadline;
+    /* An AOT body must sample the CPU IRQ line here, at its block boundary,
+     * exactly as the byte interpreter samples it between instructions (the
+     * IRQ-pending check in the run loop). Without this the AOT tier only stops
+     * at the master deadline -- the end of the field -- so a raster IRQ that
+     * latched mid-field is not taken until the beam is parked in vblank: the
+     * handler then files its display-register writes ($2100/$2107/$212C...) at
+     * keys 0-36 instead of the latch line's keys, and the forced-blank border
+     * (lines 0-224) is drawn from the level tilemap the handler just selected.
+     * It is the same defect the interpreter's check prevents, just one tier up.
+     * Depth-gated identically to the deadline so it cannot fire inside an
+     * interrupt handler: a handler runs with yield_pc==0 (sched_depth stays 0),
+     * so a handler that has not yet read $4211 cannot re-enter itself. */
+    if (!reached && in_aot_run && g_snes && g_snes->inIrq && !cpu->_flag_I)
+        reached = 1;
     if (reached) {
         s_lle_next_unwind_is_deadline = 1;
         static int fired = -1;
