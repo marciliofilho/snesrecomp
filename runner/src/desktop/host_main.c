@@ -3101,7 +3101,12 @@ static void LauncherCommit(const RecompLauncherCSettings *ls, const char *config
     snprintf(shader_path, sizeof(shader_path), "%s", ls->shader_path);
     g_config.shader = shader_path[0] ? shader_path : NULL;
   }
-  g_config.enable_audio        = true;   /* always on */
+  /* There is no Enable-audio row in the shared launcher, so this must carry
+   * the file's value through instead of forcing it: a player who set
+   * [Sound] EnableAudio = 0 (headless capture, a machine with no working
+   * output) otherwise had it silently rewritten to 1 on every launcher pass,
+   * including a plain window close. */
+  g_config.enable_audio        = ls->enable_audio != 0;
   g_config.audio_freq          = (uint16)ls->audio_freq;
   g_config.volume              = ls->volume;
   ApplyVolume();
